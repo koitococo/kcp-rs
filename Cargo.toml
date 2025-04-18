@@ -1,0 +1,16 @@
+[package]
+name = "kcp-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.97"
+bytes = "1.10.1"
+clap = { version = "4.5.36", features = ["derive"] }
+futures = "0.3.31"
+futures-util = "0.3.31"
+log = { version = "0.4.27", features = ["std"] }
+rand = "0.9.0"
+thiserror = "2.0.12"
+tokio = { version = "1.44.2", features = ["sync", "rt-multi-thread", "tokio-macros", "fs", "io-std", "net", "signal", "time", "macros", "io-util"] }
+tokio-util = "0.7.14"
