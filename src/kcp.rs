@@ -3,7 +3,7 @@ use std::{
   cmp,
   cmp::Ordering,
   collections::VecDeque,
-  fmt::{self, Debug},
+  fmt::Debug,
   io::{self, Cursor, ErrorKind, Read, Write},
 };
 
@@ -127,12 +127,14 @@ pub trait AsyncBufSend {
   fn send_buf(&self, buf: &[u8]) -> impl std::future::Future<Output = Result<usize, KcpError>>;
 }
 
+#[derive(Debug)]
 struct AnyWrite<T>(T);
 
 impl<T: AsyncBufSend> AsyncBufSend for AnyWrite<T> {
   async fn send_buf(&self, buf: &[u8]) -> Result<usize, KcpError> { self.0.send_buf(buf).await }
 }
 
+#[derive(Debug)]
 pub struct Kcp<T> {
   /// Conversation ID
   conv: u32,
@@ -203,50 +205,6 @@ pub struct Kcp<T> {
   stream: bool,
   output: AnyWrite<T>,
   fastack: bool,
-}
-
-impl<T> Debug for Kcp<T> {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    f.debug_struct("Kcp")
-      .field("conv", &self.conv)
-      .field("mtu", &self.mtu)
-      .field("mss", &self.mss)
-      .field("state", &self.state)
-      .field("snd_una", &self.snd_una)
-      .field("snd_nxt", &self.snd_nxt)
-      .field("rcv_nxt", &self.rcv_nxt)
-      .field("ssthresh", &self.ssthresh)
-      .field("rx_rttval", &self.rx_rttval)
-      .field("rx_srtt", &self.rx_srtt)
-      .field("rx_rto", &self.rx_rto)
-      .field("rx_minrto", &self.rx_minrto)
-      .field("snd_wnd", &self.snd_wnd)
-      .field("rcv_wnd", &self.rcv_wnd)
-      .field("rmt_wnd", &self.rmt_wnd)
-      .field("cwnd", &self.cwnd)
-      .field("probe", &self.probe)
-      .field("current", &self.current)
-      .field("interval", &self.interval)
-      .field("ts_flush", &self.ts_flush)
-      .field("xmit", &self.xmit)
-      .field("nodelay", &self.nodelay)
-      .field("ts_probe", &self.ts_probe)
-      .field("probe_wait", &self.probe_wait)
-      .field("dead_link", &self.dead_link)
-      .field("incr", &self.incr)
-      .field("snd_queue.len", &self.snd_queue.len())
-      .field("rcv_queue.len", &self.rcv_queue.len())
-      .field("snd_buf.len", &self.snd_buf.len())
-      .field("rcv_buf.len", &self.rcv_buf.len())
-      .field("acklist.len", &self.acklist.len())
-      .field("buf.len", &self.buf.len())
-      .field("fastresend", &self.fastresend)
-      .field("fastlimit", &self.fastlimit)
-      .field("nocwnd", &self.nocwnd)
-      .field("stream", &self.stream)
-      .field("fastack", &self.fastack)
-      .finish()
-  }
 }
 
 impl<T> Kcp<T> {
@@ -512,10 +470,6 @@ impl<T> Kcp<T> {
     // move available data from rcv_buf -> rcv_queue
     self.move_buf();
   }
-
-  /// Set `conv` value
-  #[inline]
-  pub fn set_conv(&mut self, conv: u32) { self.conv = conv; }
 
   /// Get `conv`
   #[inline]
@@ -787,176 +741,6 @@ impl<T> Kcp<T> {
 }
 
 impl<T: AsyncBufSend> Kcp<T> {
-  async fn _async_flush_ack(&mut self, segment: &mut KcpSegment) -> Result<(), KcpError> {
-    // flush acknowledges
-    // while let Some((sn, ts)) = self.acklist.pop_front() {
-    for &(sn, ts) in &self.acklist {
-      if self.buf.len() + KCP_OVERHEAD as usize > self.mtu as usize {
-        self.output.send_buf(&self.buf).await?;
-        self.buf.clear();
-      }
-      segment.sn = sn;
-      segment.ts = ts;
-      segment.encode(&mut self.buf);
-    }
-    self.acklist.clear();
-    Ok(())
-  }
-
-  async fn _async_flush_probe_commands(&mut self, cmd: u8, segment: &mut KcpSegment) -> Result<(), KcpError> {
-    segment.cmd = cmd;
-    if self.buf.len() + KCP_OVERHEAD as usize > self.mtu as usize {
-      self.output.send_buf(&self.buf).await?;
-      self.buf.clear();
-    }
-    segment.encode(&mut self.buf);
-    Ok(())
-  }
-
-  async fn async_flush_probe_commands(&mut self, segment: &mut KcpSegment) -> Result<(), KcpError> {
-    // flush window probing commands
-    if (self.probe & KCP_ASK_SEND) != 0 {
-      self._async_flush_probe_commands(KCP_CMD_WASK, segment).await?;
-    }
-    // flush window probing commands
-    if (self.probe & KCP_ASK_TELL) != 0 {
-      self._async_flush_probe_commands(KCP_CMD_WINS, segment).await?;
-    }
-    self.probe = 0;
-    Ok(())
-  }
-
-  /// Flush pending ACKs
-  pub async fn async_flush_ack(&mut self) -> Result<(), KcpError> {
-    let mut segment = KcpSegment {
-      conv: self.conv,
-      cmd: KCP_CMD_ACK,
-      wnd: self.wnd_unused(),
-      una: self.rcv_nxt,
-      ..Default::default()
-    };
-    self._async_flush_ack(&mut segment).await
-  }
-
-  /// Flush pending data in buffer.
-  pub async fn async_flush(&mut self) -> Result<(), KcpError> {
-    let mut segment = KcpSegment {
-      conv: self.conv,
-      cmd: KCP_CMD_ACK,
-      wnd: self.wnd_unused(),
-      una: self.rcv_nxt,
-      ..Default::default()
-    };
-    self._async_flush_ack(&mut segment).await?;
-    self.probe_wnd_size();
-    self.async_flush_probe_commands(&mut segment).await?;
-    // println!("SNDBUF size {}", self.snd_buf.len());
-    // calculate window size
-    let mut cwnd = cmp::min(self.snd_wnd, self.rmt_wnd);
-    if !self.nocwnd {
-      cwnd = cmp::min(self.cwnd, cwnd);
-    }
-    // move data from snd_queue to snd_buf
-    while timediff(self.snd_nxt, self.snd_una + cwnd as u32) < 0 {
-      match self.snd_queue.pop_front() {
-        Some(mut new_segment) => {
-          new_segment.conv = self.conv;
-          new_segment.cmd = KCP_CMD_PUSH;
-          new_segment.wnd = segment.wnd;
-          new_segment.ts = self.current;
-          new_segment.sn = self.snd_nxt;
-          self.snd_nxt += 1;
-          new_segment.una = self.rcv_nxt;
-          new_segment.resendts = self.current;
-          new_segment.rto = self.rx_rto;
-          new_segment.fastack = 0;
-          new_segment.xmit = 0;
-          self.snd_buf.push_back(new_segment);
-        }
-        None => break,
-      }
-    }
-    // calculate resent
-    let resent = if self.fastresend > 0 { self.fastresend } else { u32::max_value() };
-    let rtomin = if !self.nodelay { self.rx_rto >> 3 } else { 0 };
-    let mut lost = false;
-    let mut change = 0;
-    for snd_segment in &mut self.snd_buf {
-      let mut need_send = false;
-      if snd_segment.xmit == 0 {
-        need_send = true;
-        snd_segment.xmit += 1;
-        snd_segment.rto = self.rx_rto;
-        snd_segment.resendts = self.current + snd_segment.rto + rtomin;
-      } else if timediff(self.current, snd_segment.resendts) >= 0 {
-        need_send = true;
-        snd_segment.xmit += 1;
-        self.xmit += 1;
-        if !self.nodelay {
-          snd_segment.rto += cmp::max(snd_segment.rto, self.rx_rto);
-        } else {
-          let step = snd_segment.rto; // (kcp->nodelay < 2) ? ((IINT32)(segment->rto)) : kcp->rx_rto;
-          snd_segment.rto += step / 2;
-        }
-        snd_segment.resendts = self.current + snd_segment.rto;
-        lost = true;
-      } else if snd_segment.fastack >= resent {
-        if snd_segment.xmit <= self.fastlimit || self.fastlimit <= 0 {
-          need_send = true;
-          snd_segment.xmit += 1;
-          snd_segment.fastack = 0;
-          snd_segment.resendts = self.current + snd_segment.rto;
-          change += 1;
-        }
-      }
-      if need_send {
-        snd_segment.ts = self.current;
-        snd_segment.wnd = segment.wnd;
-        snd_segment.una = self.rcv_nxt;
-        let need = KCP_OVERHEAD as usize + snd_segment.data.len();
-        if self.buf.len() + need > self.mtu as usize {
-          self.output.send_buf(&self.buf).await?;
-          self.buf.clear();
-        }
-        snd_segment.encode(&mut self.buf);
-        if snd_segment.xmit >= self.dead_link {
-          self.state = false;
-        }
-      }
-    }
-    // Flush all data in buffer
-    if !self.buf.is_empty() {
-      self.output.send_buf(&self.buf).await?;
-      self.buf.clear();
-    }
-    // update ssthresh
-    if change > 0 {
-      let inflight = self.snd_nxt - self.snd_una;
-      self.ssthresh = inflight as u16 / 2;
-      if self.ssthresh < KCP_THRESH_MIN {
-        self.ssthresh = KCP_THRESH_MIN;
-      }
-      self.cwnd = self.ssthresh + resent as u16;
-      self.incr = self.cwnd as usize * self.mss;
-    }
-    if lost {
-      self.ssthresh = cwnd / 2;
-      if self.ssthresh < KCP_THRESH_MIN {
-        self.ssthresh = KCP_THRESH_MIN;
-      }
-      self.cwnd = 1;
-      self.incr = self.mss;
-    }
-    if self.cwnd < 1 {
-      self.cwnd = 1;
-      self.incr = self.mss;
-    }
-    Ok(())
-  }
-
-  /// Update state every 10ms ~ 100ms.
-  ///
-  /// Or you can ask `check` when to call this again.
   pub async fn async_update(&mut self, current: u32) -> Result<(), KcpError> {
     self.current = current;
     let mut slap = timediff(self.current, self.ts_flush);
@@ -969,7 +753,147 @@ impl<T: AsyncBufSend> Kcp<T> {
       if timediff(self.current, self.ts_flush) >= 0 {
         self.ts_flush = self.current + self.interval;
       }
-      self.async_flush().await?;
+
+      // flush data
+      let mut segment = KcpSegment {
+        conv: self.conv,
+        cmd: KCP_CMD_ACK,
+        wnd: self.wnd_unused(),
+        una: self.rcv_nxt,
+        ..Default::default()
+      };
+      // flush pending ACKs
+      for &(sn, ts) in &self.acklist {
+        if self.buf.len() + KCP_OVERHEAD as usize > self.mtu as usize {
+          self.output.send_buf(&self.buf).await?;
+          self.buf.clear();
+        }
+        segment.sn = sn;
+        segment.ts = ts;
+        segment.encode(&mut self.buf);
+      }
+      self.acklist.clear();
+  
+      // flush pending wnd probe
+      self.probe_wnd_size();
+      if (self.probe & KCP_ASK_SEND) != 0 {
+        segment.cmd = KCP_CMD_WASK;
+        if self.buf.len() + KCP_OVERHEAD > self.mtu {
+          self.output.send_buf(&self.buf).await?;
+          self.buf.clear();
+        }
+        segment.encode(&mut self.buf);
+      }
+      if (self.probe & KCP_ASK_TELL) != 0 {
+        segment.cmd = KCP_CMD_WINS;
+        if self.buf.len() + KCP_OVERHEAD > self.mtu {
+          self.output.send_buf(&self.buf).await?;
+          self.buf.clear();
+        }
+        segment.encode(&mut self.buf);
+      }
+      self.probe = 0;
+  
+      // calculate window size
+      let mut cwnd = cmp::min(self.snd_wnd, self.rmt_wnd);
+      if !self.nocwnd {
+        cwnd = cmp::min(self.cwnd, cwnd);
+      }
+      // move data from snd_queue to snd_buf
+      while timediff(self.snd_nxt, self.snd_una + cwnd as u32) < 0 {
+        match self.snd_queue.pop_front() {
+          Some(mut new_segment) => {
+            new_segment.conv = self.conv;
+            new_segment.cmd = KCP_CMD_PUSH;
+            new_segment.wnd = segment.wnd;
+            new_segment.ts = self.current;
+            new_segment.sn = self.snd_nxt;
+            self.snd_nxt += 1;
+            new_segment.una = self.rcv_nxt;
+            new_segment.resendts = self.current;
+            new_segment.rto = self.rx_rto;
+            new_segment.fastack = 0;
+            new_segment.xmit = 0;
+            self.snd_buf.push_back(new_segment);
+          }
+          None => break,
+        }
+      }
+      // calculate resent
+      let resent = if self.fastresend > 0 { self.fastresend } else { u32::max_value() };
+      let rtomin = if !self.nodelay { self.rx_rto >> 3 } else { 0 };
+      let mut lost = false;
+      let mut change = 0;
+      for snd_segment in &mut self.snd_buf {
+        let mut need_send = false;
+        if snd_segment.xmit == 0 {
+          need_send = true;
+          snd_segment.xmit += 1;
+          snd_segment.rto = self.rx_rto;
+          snd_segment.resendts = self.current + snd_segment.rto + rtomin;
+        } else if timediff(self.current, snd_segment.resendts) >= 0 {
+          need_send = true;
+          snd_segment.xmit += 1;
+          self.xmit += 1;
+          if !self.nodelay {
+            snd_segment.rto += cmp::max(snd_segment.rto, self.rx_rto);
+          } else {
+            let step = snd_segment.rto; // (kcp->nodelay < 2) ? ((IINT32)(segment->rto)) : kcp->rx_rto;
+            snd_segment.rto += step / 2;
+          }
+          snd_segment.resendts = self.current + snd_segment.rto;
+          lost = true;
+        } else if snd_segment.fastack >= resent {
+          if snd_segment.xmit <= self.fastlimit || self.fastlimit <= 0 {
+            need_send = true;
+            snd_segment.xmit += 1;
+            snd_segment.fastack = 0;
+            snd_segment.resendts = self.current + snd_segment.rto;
+            change += 1;
+          }
+        }
+        if need_send {
+          snd_segment.ts = self.current;
+          snd_segment.wnd = segment.wnd;
+          snd_segment.una = self.rcv_nxt;
+          let need = KCP_OVERHEAD as usize + snd_segment.data.len();
+          if self.buf.len() + need > self.mtu as usize {
+            self.output.send_buf(&self.buf).await?;
+            self.buf.clear();
+          }
+          snd_segment.encode(&mut self.buf);
+          if snd_segment.xmit >= self.dead_link {
+            self.state = false;
+          }
+        }
+      }
+      // Flush all data in buffer
+      if !self.buf.is_empty() {
+        self.output.send_buf(&self.buf).await?;
+        self.buf.clear();
+      }
+      // update ssthresh
+      if change > 0 {
+        let inflight = self.snd_nxt - self.snd_una;
+        self.ssthresh = inflight as u16 / 2;
+        if self.ssthresh < KCP_THRESH_MIN {
+          self.ssthresh = KCP_THRESH_MIN;
+        }
+        self.cwnd = self.ssthresh + resent as u16;
+        self.incr = self.cwnd as usize * self.mss;
+      }
+      if lost {
+        self.ssthresh = cwnd / 2;
+        if self.ssthresh < KCP_THRESH_MIN {
+          self.ssthresh = KCP_THRESH_MIN;
+        }
+        self.cwnd = 1;
+        self.incr = self.mss;
+      }
+      if self.cwnd < 1 {
+        self.cwnd = 1;
+        self.incr = self.mss;
+      }  
     }
     Ok(())
   }
