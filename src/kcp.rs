@@ -143,7 +143,7 @@ pub struct Kcp<T> {
   /// Maximum Segment Size
   mss: usize,
   /// Connection state
-  state: bool,
+  available: bool,
   /// First unacknowledged packet
   snd_una: u32,
   /// Next packet
@@ -201,8 +201,6 @@ pub struct Kcp<T> {
   fastlimit: u32,
   /// Disable congestion control
   nocwnd: bool,
-  /// Enable stream mode
-  stream: bool,
   output: AnyWrite<T>,
   fastack: bool,
 }
@@ -212,7 +210,7 @@ impl<T> Kcp<T> {
   /// `output` is the callback object for writing.
   ///
   /// `conv` represents conversation.
-  pub fn new(conv: u32, output: T, stream: bool, fastack: bool, now: u32) -> Self {
+  pub fn new(conv: u32, output: T, fastack: bool, now: u32) -> Self {
     Kcp {
       conv,
       snd_una: 0,
@@ -228,13 +226,12 @@ impl<T> Kcp<T> {
       probe: 0,
       mtu: KCP_MTU_DEF,
       mss: KCP_MTU_DEF - KCP_OVERHEAD,
-      stream,
       buf: BytesMut::with_capacity((KCP_MTU_DEF + KCP_OVERHEAD) as usize * 3),
       snd_queue: VecDeque::new(),
       rcv_queue: VecDeque::new(),
       snd_buf: VecDeque::new(),
       rcv_buf: VecDeque::new(),
-      state: true,
+      available: true,
       acklist: VecDeque::new(),
       rx_srtt: 0,
       rx_rttval: 0,
@@ -326,44 +323,20 @@ impl<T> Kcp<T> {
 
   /// Send bytes into buffer
   pub fn send(&mut self, mut buf: &[u8]) -> Result<usize, KcpError> {
-    if !self.state {
+    if !self.available {
       return Err(KcpError::ClosedConv);
     }
     let mut sent_size = 0;
-    assert!(self.mss > 0);
-    // append to previous segment in streaming mode (if possible)
-    if self.stream {
-      if let Some(old) = self.snd_queue.back_mut() {
-        let l = old.data.len();
-        if l < self.mss as usize {
-          let capacity = self.mss as usize - l;
-          let extend = cmp::min(buf.len(), capacity);
-          let (lf, rt) = buf.split_at(extend);
-          old.data.extend_from_slice(lf);
-          buf = rt;
-          old.frg = 0;
-          sent_size += extend;
-        }
-      }
-      if buf.is_empty() {
-        return Ok(sent_size);
-      }
-    }
-    let count = if buf.len() <= self.mss as usize {
-      1
-    } else {
-      (buf.len() + self.mss as usize - 1) / self.mss as usize
-    };
-    if count >= KCP_WND_RCV as usize {
+    let count = buf.len().div_ceil(self.mss);
+    if count >= KCP_WND_RCV as usize || count == 0 {
       return Err(KcpError::InvalidBufSize);
     }
-    let count = cmp::max(1, count);
     for i in 0..count {
       let size = cmp::min(self.mss as usize, buf.len());
       let (lf, rt) = buf.split_at(size);
       let mut new_segment = KcpSegment::new_with_data(lf.into());
       buf = rt;
-      new_segment.frg = if self.stream { 0 } else { (count - i - 1) as u8 };
+      new_segment.frg = (count - i - 1) as u8 ;
       self.snd_queue.push_back(new_segment);
       sent_size += size;
     }
@@ -443,9 +416,6 @@ impl<T> Kcp<T> {
       }
     }
   }
-
-  #[inline]
-  fn ack_push(&mut self, sn: u32, ts: u32) { self.acklist.push_back((sn, ts)); }
 
   fn parse_data(&mut self, new_segment: KcpSegment) {
     let sn = new_segment.sn;
@@ -534,7 +504,8 @@ impl<T> Kcp<T> {
         }
         KCP_CMD_PUSH => {
           if timediff(sn, self.rcv_nxt + self.rcv_wnd as u32) < 0 {
-            self.ack_push(sn, ts);
+            {
+                let this = &mut *self; this.acklist.push_back((sn, ts)); };
             if timediff(sn, self.rcv_nxt) >= 0 {
               let mut sbuf = BytesMut::with_capacity(len as usize);
               unsafe {
@@ -648,13 +619,14 @@ impl<T> Kcp<T> {
   pub fn mtu(&self) -> usize { self.mtu }
 
   /// Set check interval
-  pub fn set_interval(&mut self, mut interval: u32) {
-    if interval > 5000 {
-      interval = 5000;
+  pub fn set_interval(&mut self, interval: u32) {
+    self.interval = if interval > 5000 {
+      5000
     } else if interval < 10 {
-      interval = 10;
-    }
-    self.interval = interval;
+      10
+    } else {
+      interval
+    };
   }
 
   /// Set nodelay
@@ -723,10 +695,6 @@ impl<T> Kcp<T> {
   #[inline]
   pub fn header_len() -> usize { KCP_OVERHEAD as usize }
 
-  /// Enabled stream or not
-  #[inline]
-  pub fn is_stream(&self) -> bool { self.stream }
-
   /// Maximum Segment Size
   #[inline]
   pub fn mss(&self) -> usize { self.mss }
@@ -737,7 +705,7 @@ impl<T> Kcp<T> {
 
   /// Check if KCP connection is dead (resend times excceeded)
   #[inline]
-  pub fn is_dead_link(&self) -> bool { !self.state }
+  pub fn is_unavailable(&self) -> bool { !self.available }
 }
 
 impl<T: AsyncBufSend> Kcp<T> {
@@ -863,7 +831,7 @@ impl<T: AsyncBufSend> Kcp<T> {
           }
           snd_segment.encode(&mut self.buf);
           if snd_segment.xmit >= self.dead_link {
-            self.state = false;
+            self.available = false;
           }
         }
       }
